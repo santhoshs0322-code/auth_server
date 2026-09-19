@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: central-game-auth
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      - key: MONGODB_URI
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: PUBLIC_URL
+        sync: false
+      - key: ALLOWED_ORIGIN
+        value: "*"
