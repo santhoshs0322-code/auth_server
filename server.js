@@ -121,6 +121,35 @@ app.get("/auth/google/callback", async (req, res) => {
   }
 });
 
+app.post("/auth/google/native", async (req, res) => {
+  try {
+    const appId = String(req.body.app || "").toLowerCase();
+    const idToken = String(req.body.idToken || "");
+    if (!apps[appId]) return res.status(400).json({ ok: false, message: "Unknown app" });
+    if (!idToken || idToken.length > 10000) return res.status(400).json({ ok: false, message: "Missing identity token" });
+
+    const ticket = await google.verifyIdToken({ idToken, audience: process.env.GOOGLE_CLIENT_ID });
+    const profile = ticket.getPayload();
+    if (!profile || !profile.sub || !profile.email_verified) {
+      return res.status(401).json({ ok: false, message: "Google account is not verified" });
+    }
+
+    const User = usersFor(appId);
+    const user = await User.findOneAndUpdate(
+      { googleSub: profile.sub },
+      { $set: { email: profile.email, name: profile.name || profile.email, picture: profile.picture || "", lastLoginAt: new Date() } },
+      { new: true, upsert: true, setDefaultsOnInsert: true }
+    );
+    res.json({ ok: true, token: issueToken(user, appId), user: {
+      id: user.id, name: user.name, email: user.email, picture: user.picture,
+      createdAt: user.createdAt.toISOString(), lastLoginAt: user.lastLoginAt.toISOString()
+    }});
+  } catch (error) {
+    console.error("Native Google sign-in failed", error.message);
+    res.status(401).json({ ok: false, message: "Invalid Google identity token" });
+  }
+});
+
 app.get("/api/me", requireAuth, async (req, res) => {
   const User = usersFor(req.auth.appId);
   const user = await User.findById(req.auth.sub).lean();
