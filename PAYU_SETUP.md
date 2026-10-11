@@ -2,7 +2,7 @@
 
 Target: **https://auth-server-2bis.onrender.com**
 
-This service now includes Monster Merge coin-payment endpoints alongside the existing Balloon Pop and Candy Craze Google-auth routes. Google authentication is unchanged. PayU records use separate MongoDB collections, so no Render disk or extra Python service is required.
+This service now includes Monster Merge coin-payment endpoints alongside the existing Balloon Pop and Candy Craze Google-auth routes. Monster Merge now requires Google sign-in before purchases. PayU records use separate MongoDB collections, so no Render disk or extra Python service is required.
 
 ## Deploy
 
@@ -50,7 +50,7 @@ Until server environment variables are configured, the auth service continues ru
 - The server checks the PayU response SHA-512 hash, then independently calls `verify_payment`. Only a matching successful, captured transaction can credit coins.
 - Prices, amounts and owner metadata come from the server. The client cannot set them.
 - Customer contact details are stored per order to keep retries consistent. Restrict Atlas and backup access and set an appropriate retention policy. Do not log request bodies, bearer tokens, salts or checkout URLs.
-- Payment accounts are installation-bound guest accounts. They are **not** Google-auth accounts. Cross-device recovery and uninstall restore are not implemented. Offline coin spending remains a local save. Arrange recovery/refund support before live sales.
+- Payment accounts are installation-bound and linked to a verified Google user. Cross-device recovery and uninstall restore are not implemented. Offline coin spending remains a local save. Arrange recovery/refund support before live sales.
 - Existing paid Razorpay accounts need an explicit migration; do not overwrite old ledgers or clear paid-save data. The Python backend is a separate alternative, not a second service to run against this Mongo ledger.
 - This integration targets direct APK distribution. A Play Store release still requires the applicable Google billing/alternative-billing program integration.
 
@@ -58,8 +58,23 @@ Until server environment variables are configured, the auth service continues ru
 
 Use Node 22 (same as the Dockerfile) and install the existing locked dependencies with `npm ci`. Run `npm run check`.
 
-`npm run test:payments` runs 18 integration tests against an isolated local MongoDB replica set. On this Windows machine the MongoDB binary is `C:/Program Files/MongoDB/Server/8.2/bin/mongod.exe`; elsewhere set `MONGOD_BINARY` to your local binary. Tests create and remove their own temporary database and use invented keys. They do not use the production `MONGODB_URI`.
+`npm run test:payments` runs 22 integration tests against an isolated local MongoDB replica set. On this Windows machine the MongoDB binary is `C:/Program Files/MongoDB/Server/8.2/bin/mongod.exe`; elsewhere set `MONGOD_BINARY` to your local binary. Tests create and remove their own temporary database and use invented keys. They do not use the production `MONGODB_URI`.
 
 Validated: hash protocol vectors, amount validation, order idempotency, ownership, escaped checkout, forged callbacks, captured-payment verification, concurrent credits, transaction rollback, duplicate payment IDs, delayed recovery, provider outage, connection restart, test/live isolation, HTTP routes, and existing auth-server startup.
 
 Official references: [PayU Hosted Checkout](https://docs.payu.in/docs/prebuilt-checkout-page-integration), [hashing](https://docs.payu.in/docs/hashing-request-and-response), [verification](https://docs.payu.in/reference/verify_payment_api), [Mongoose transactions](https://mongoosejs.com/docs/transactions.html).
+
+
+## Google purchase gate
+
+Keep the existing Google Web OAuth credentials and authorized callback `https://auth-server-2bis.onrender.com/auth/google/callback`. Google consent-screen test-user restrictions apply if the Google project is in Testing mode. No Google secret belongs in the APK.
+
+In the game, choose Sign in with Google, select your account in the browser, then return to the game. Guests can still play and earn coins. Coin packs, dragon purchases and stage upgrades require sign-in. Offline dragon spending remains local; this does not implement server-side inventory or cross-device save recovery.
+
+POST `/auth/monster/start` with `{}` creates a ten-minute login attempt. Open its authorizationUrl in the system browser. POST loginId and private pollToken to `/auth/monster/poll` to obtain the single-use result and app-specific session. GET `/auth/monster/me` validates its Bearer token. Sessions expire after thirty days; POST `/auth/logout` revokes the session.
+
+Payment account creation, linking, wallet and order operations require the Google session in `X-Game-Session`. Existing payment-account Bearer authentication is also required except during account creation. POST `/api/accounts/link` binds an existing installation account once without losing credits or orders. Another Google account cannot rebind it. PayU callbacks retain independent payment verification.
+
+Docker must include monster-auth.js. New Mongo collections are monstermerge_users and monster_google_logins. Existing games retain their own user collections.
+
+Tests cover missing, forged, expired, revoked and wrong-app sessions, Google nonce and verified-email checks, single-use polling, and legacy payment-account linking. Automated tests use mocked Google responses; complete one real Google sign-in on the device after deployment.

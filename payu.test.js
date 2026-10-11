@@ -40,7 +40,7 @@ before(async()=>{
 after(async()=>{
   if(connection)await connection.close();
   if(mongo&&mongo.exitCode===null){const done=once(mongo,'exit');mongo.kill();await done;}
-  if(folder)fs.rmSync(folder,{recursive:true,force:true}); // Only our unique temporary database.
+  if(folder){const resolved=path.resolve(folder);if(path.dirname(resolved)!==path.resolve(os.tmpdir())||!path.basename(resolved).startsWith('monster-payu-mongo-'))throw new Error('Unsafe cleanup path');fs.rmSync(resolved,{recursive:true,force:true});}
 });
 beforeEach(async()=>{
   clock=1900000000000;remote=new Map();
@@ -53,7 +53,7 @@ beforeEach(async()=>{
     return {ok:true,json:async()=>({transaction_details:{[id]:remote.get(id)||{status:'Not Found'}}})};
   }});
   await Promise.all([service.Account.deleteMany({}),service.Order.deleteMany({}),service.Credit.deleteMany({})]);
-  account=await service.createAccount();order=await service.createOrder(account.accountId,{packId:'starter',requestId:'test_request_001'});
+  account=await service.createAccount('google-fixture');order=await service.createOrder(account.accountId,{packId:'starter',requestId:'test_request_001'});
   row=await service.storedOrder(order.orderId);
 });
 function capture(changes={},target=row) {
@@ -104,7 +104,7 @@ test('bearer tokens are hashed and another account cannot query an order',async(
   assert.notEqual(stored.tokenHash,account.token);assert.equal(stored.token,undefined);
   assert.equal(await service.authenticate('Bearer '+account.token),account.accountId);
   await rejects(()=>service.authenticate('Bearer bad'),'unauthorized');
-  const other=await service.createAccount();
+  const other=await service.createAccount('google-fixture');
   await rejects(()=>service.getOrder(other.accountId,order.orderId),'order_not_found');
 });
 test('contact validation, HTML escaping and no salt or bearer in checkout',async()=>{
@@ -184,7 +184,7 @@ test('restarting database connection preserves credits and test/live isolation',
   }finally{await next.close();}
 });
 test('HTTP app contract, form callbacks, webhook replay and unrelated routes',async()=>{
-  const app=express(),payments=createPayments({connection,env,fetchImpl:service.fetch,now:()=>clock});
+  const app=express(),payments=createPayments({connection,env,fetchImpl:service.fetch,now:()=>clock,authenticateGoogle:async token=>{if(token!=='fixture-session')throw new (require('./payu').PaymentError)(401,'google_login_required','Sign in');return {sub:'google-fixture'};}});
   app.use(payments.router);app.get('/health',(_req,res)=>res.json({ok:true,apps:['balloonpop','candycraze']}));
   const server=app.listen(0,'127.0.0.1');await once(server,'listening');
   const base='http://127.0.0.1:'+server.address().port;
@@ -218,10 +218,91 @@ test('actual auth server boots with payments disabled and preserves Google route
     }
     assert.equal(healthy,true);
     const base=`http://127.0.0.1:${port}`;
-    assert.deepEqual((await (await fetch(base+'/health')).json()).apps,['balloonpop','candycraze']);
+    assert.deepEqual((await (await fetch(base+'/health')).json()).apps,['monstermerge','balloonpop','candycraze']);
     assert.equal((await (await fetch(base+'/payments/health')).json()).paymentsEnabled,false);
     assert.equal((await fetch(base+'/auth/google?app=unknown')).status,400);
     assert.equal((await fetch(base+'/api/me')).status,401);
-    assert.equal((await fetch(base+'/api/accounts',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})).status,503);
+    assert.equal((await fetch(base+'/api/accounts',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})).status,401);
+  }finally{if(child.exitCode===null){const done=once(child,'exit');child.kill();await done;}}
+});
+
+test('guest checkout is blocked until linked, and cannot be linked to another Google user',async()=>{
+  await service.Account.updateOne({_id:account.accountId},{$unset:{googleUserId:''}});
+  await rejects(()=>service.checkoutOrder(row.checkoutToken),'google_login_required');
+  await rejects(()=>service.authorizeAccount(account.accountId,'google-fixture'),'account_mismatch');
+  await service.linkAccount(account.accountId,'google-fixture');
+  assert.equal((await service.checkoutOrder(row.checkoutToken))._id,row._id);
+  await rejects(()=>service.linkAccount(account.accountId,'other-google-user'),'account_mismatch');
+  await rejects(()=>service.authorizeAccount(account.accountId,'other-google-user'),'account_mismatch');
+});
+test('linking preserves existing credits and pending orders',async()=>{
+  capture();await service.reconcile(row);
+  await service.Account.updateOne({_id:account.accountId},{$unset:{googleUserId:''}});
+  await service.linkAccount(account.accountId,'google-fixture');
+  assert.equal((await service.wallet(account.accountId)).creditedCoinsTotal,500);
+  assert.equal((await service.storedOrder(row._id)).status,'paid');
+});
+
+test('Google browser sign-in validates nonce, private polling and one-time exchange',async()=>{
+  const {createMonsterAuth}=require('./monster-auth');
+  const userSchema=new mongoose.Schema({googleSub:{type:String,unique:true},email:String,name:String,picture:String,lastLoginAt:Date});
+  const User=connection.models.MonsterAuthTestUser||connection.model('MonsterAuthTestUser',userSchema,'monster_auth_test_users');
+  let nonce,profileChanges={};
+  const google={generateAuthUrl:options=>{nonce=options.nonce;return 'https://accounts.google.com/o/oauth2/v2/auth?'+new URLSearchParams(options);},
+    getToken:async()=>({tokens:{id_token:'fixture-id-token'}}),verifyIdToken:async()=>({getPayload:()=>({sub:'verified-google-sub',email:'test@example.com',email_verified:true,name:'Tester',nonce,...profileChanges})})};
+  const auth=createMonsterAuth({connection,google,clientId:'fixture-client',users:()=>User,issueToken:user=>'fixture-session-'+user.id,
+    verifySession:async()=>({sub:'unused'}),now:()=>clock});
+  await User.init();await auth.initialize();await auth.Login.deleteMany({});
+  const app=express();app.use('/auth/monster',auth.router);app.get('/auth/google/callback',auth.callback);
+  const server=app.listen(0,'127.0.0.1');await once(server,'listening');const base='http://127.0.0.1:'+server.address().port;
+  const post=async(path,body)=>fetch(base+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  try {
+    const start=await (await post('/auth/monster/start',{})).json();
+    assert.equal(new URL(start.authorizationUrl).hostname,'accounts.google.com');
+    assert.ok(!start.authorizationUrl.includes(start.pollToken));
+    let response=await post('/auth/monster/poll',{loginId:start.loginId,pollToken:'x'.repeat(43)});assert.equal(response.status,410);
+    response=await post('/auth/monster/poll',start);assert.equal((await response.json()).status,'pending');
+    response=await fetch(base+'/auth/google/callback?state='+start.loginId+'&code=google-fixture');
+    assert.equal(response.status,200);assert.ok(!(await response.text()).includes('fixture-session'));
+    const ready=await (await post('/auth/monster/poll',start)).json();assert.equal(ready.status,'signed_in');assert.match(ready.token,/^fixture-session-/);
+    assert.equal((await post('/auth/monster/poll',start)).status,410);
+    assert.equal((await fetch(base+'/auth/google/callback?state='+start.loginId+'&code=google-fixture')).status,400);
+    for(const invalid of [{nonce:'wrong'},{email_verified:false}]) {
+      profileChanges=invalid;const next=await (await post('/auth/monster/start',{})).json();
+      assert.equal((await fetch(base+'/auth/google/callback?state='+next.loginId+'&code=google-fixture')).status,400);
+      assert.equal((await (await post('/auth/monster/poll',next)).json()).status,'failed');
+    }
+    profileChanges={};const expired=await (await post('/auth/monster/start',{})).json();clock+=600001;
+    assert.equal((await post('/auth/monster/poll',expired)).status,410);
+  } finally {server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}
+});
+
+test('deployed-style server enforces real signed Monster Merge JWT for purchases',async()=>{
+  const jwt=require('jsonwebtoken');const port=await freePort();const secret='test-fixture-jwt-secret-longer-than-32-characters';
+  const userId=new mongoose.Types.ObjectId();
+  await connection.db.collection('monstermerge_users').insertOne({_id:userId,googleSub:'google-auth-integration-fixture',
+    email:'fixture@example.com',name:'Test User',createdAt:new Date(),lastLoginAt:new Date()});
+  const child=spawn(process.execPath,[path.join(__dirname,'server.js')],{cwd:__dirname,windowsHide:true,stdio:'ignore',
+    env:{...process.env,MONGODB_URI:uri,PORT:String(port),PUBLIC_URL:'https://payments.example',PAYU_PUBLIC_URL:'https://payments.example',
+      GOOGLE_CLIENT_ID:'fixture.apps.googleusercontent.com',GOOGLE_CLIENT_SECRET:'fixture-google-secret',JWT_SECRET:secret,
+      PAYMENTS_ENABLED:'true',PAYMENT_MODE:'test',PAYU_KEY:'fixture-key',PAYU_SALT:'fixture-salt'}});
+  const base=`http://127.0.0.1:${port}`;
+  const token=(app='monstermerge',options={})=>jwt.sign({sub:String(userId),appId:app},secret,{issuer:'central-game-auth',audience:app,jwtid:crypto.randomUUID(),expiresIn:'1h',...options});
+  const request=(path,session,body={},bearer='')=>fetch(base+path,{method:'POST',headers:{'Content-Type':'application/json',
+    ...(session?{'X-Game-Session':session}:{}),...(bearer?{Authorization:'Bearer '+bearer}:{})},body:JSON.stringify(body)});
+  try {
+    let ready=false;
+    for(let i=0;i<80;i++){try{if((await fetch(base+'/health')).ok){ready=true;break;}}catch(_){}await pause(100);}
+    assert.equal(ready,true);
+    assert.equal((await (await fetch(base+'/api/catalog')).json()).requiresGoogleLogin,true);
+    for(const invalid of ['',token('balloonpop'),token('monstermerge',{expiresIn:-1}),token()+'broken'])
+      assert.equal((await request('/api/accounts',invalid)).status,401);
+    const signed=token();let response=await request('/api/accounts',signed);assert.equal(response.status,201);
+    const buyer=await response.json();
+    response=await request('/api/orders','',{packId:'starter',requestId:'auth_order_1'},buyer.token);assert.equal(response.status,401);
+    response=await request('/api/orders',signed,{packId:'starter',requestId:'auth_order_1'},buyer.token);assert.equal(response.status,200);
+    const created=await response.json();assert.equal(created.amountPaise,4900);
+    const revoked=jwt.decode(signed);await connection.db.collection('revoked_tokens').insertOne({jti:revoked.jti,expiresAt:new Date(revoked.exp*1000)});
+    response=await request('/api/orders',signed,{packId:'starter',requestId:'auth_order_2'},buyer.token);assert.equal(response.status,401);
   }finally{if(child.exitCode===null){const done=once(child,'exit');child.kill();await done;}}
 });

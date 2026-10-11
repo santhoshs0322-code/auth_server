@@ -62,7 +62,7 @@ function modelsFor(connection,mode) {
   const prefix='monster_payu_'+mode;
   const model=(name,schema)=>connection.models[prefix+name]||connection.model(prefix+name,schema,prefix+'_'+name);
   const account=new Schema({_id:String,tokenHash:{type:String,unique:true,required:true},
-    creditedCoinsTotal:{type:Number,default:0},created:Number},{versionKey:false});
+    googleUserId:{type:String,index:true},creditedCoinsTotal:{type:Number,default:0},created:Number},{versionKey:false});
   const order=new Schema({_id:String,accountId:{type:String,required:true},requestId:String,packId:String,
     coins:Number,amountPaise:Number,currency:String,receipt:String,
     checkoutToken:{type:String,unique:true,required:true},created:Number,expires:Number,
@@ -81,10 +81,11 @@ class PayUService {
   }
   async initialize() { await Promise.all([this.Account.init(),this.Order.init(),this.Credit.init()]); }
   requireEnabled() { if (!this.config.enabled) fail(503,'payments_unavailable','Coin payments are not available yet.'); }
-  catalog() { return {provider:'payu',packs:PACKS,testMode:this.config.mode==='test',enabled:this.config.enabled}; }
-  async createAccount() {
+  catalog() { return {provider:'payu',requiresGoogleLogin:true,packs:PACKS,testMode:this.config.mode==='test',enabled:this.config.enabled}; }
+  async createAccount(googleUserId) {
+    if (!googleUserId) fail(401,'google_login_required','Sign in with Google to purchase.');
     const accountId='acct_'+crypto.randomBytes(16).toString('hex'),token=crypto.randomBytes(48).toString('base64url');
-    await this.Account.create({_id:accountId,tokenHash:digest(token),created:this.now()});
+    await this.Account.create({_id:accountId,tokenHash:digest(token),googleUserId,created:this.now()});
     return {accountId,token};
   }
   async authenticate(header) {
@@ -92,6 +93,17 @@ class PayUService {
     const account=await this.Account.findOne({tokenHash:digest(header.slice(7))}).lean();
     if (!account) fail(401,'unauthorized','Invalid payment account.');
     return account._id;
+  }
+  async linkAccount(accountId,googleUserId) {
+    const linked=await this.Account.findOneAndUpdate({_id:accountId,$or:[{googleUserId:{$exists:false}},{googleUserId}]},
+      {$set:{googleUserId}},{new:true}).lean();
+    if(!linked) fail(403,'account_mismatch','This payment account belongs to another Google account.');
+    return {accountId:linked._id};
+  }
+  async authorizeAccount(accountId,googleUserId) {
+    if(!googleUserId || !await this.Account.exists({_id:accountId,googleUserId}))
+      fail(403,'account_mismatch','Sign in with the Google account linked to this save.');
+    return accountId;
   }
   async storedOrder(id,owner) {
     if (typeof id!=='string'||!/^order_[a-f0-9]{18}$/.test(id)) fail(404,'order_not_found','Order not found.');
@@ -139,6 +151,8 @@ class PayUService {
     if (!/^[A-Za-z0-9_-]{43}$/.test(token)) fail(404,'checkout_not_found','Checkout link not found.');
     const row=await this.Order.findOne({checkoutToken:token}).lean();
     if (!row) fail(404,'checkout_not_found','Checkout link not found.');
+    const account=await this.Account.findById(row.accountId).lean();
+    if(!account?.googleUserId) fail(401,'google_login_required','Return to the game and sign in with Google before purchasing.');
     if (this.now()>=row.expires) fail(410,'checkout_expired','Checkout expired. Return to the game and refresh before trying again.');
     return row;
   }
@@ -256,7 +270,7 @@ class PayUService {
   }
 }
 
-function createPayments({connection,env=process.env,fetchImpl,now}) {
+function createPayments({connection,env=process.env,fetchImpl,now,authenticateGoogle}) {
   const config=configuration(env), service=new PayUService({connection,config,fetchImpl,now});
   const router=express.Router(), buckets=new Map();
   const limit=(key,max)=>{
@@ -266,7 +280,7 @@ function createPayments({connection,env=process.env,fetchImpl,now}) {
     if (++bucket.count>max) fail(429,'rate_limited','Please wait and try again.');
     buckets.set(key,bucket);
   };
-  const paths=/^(?:\/payments\/health|\/api\/(?:accounts|catalog|wallet|orders(?:\/[^/]+)?|payu\/return|webhooks\/payu)|\/checkout\/[^/]+(?:\/pay)?)$/;
+  const paths=/^(?:\/payments\/health|\/api\/(?:accounts(?:\/link)?|catalog|wallet|orders(?:\/[^/]+)?|payu\/return|webhooks\/payu)|\/checkout\/[^/]+(?:\/pay)?)$/;
   router.use((req,res,next)=>{
     if (!paths.test(req.path)) return next('router');
     res.set({'Cache-Control':'no-store','Referrer-Policy':'no-referrer','X-Content-Type-Options':'nosniff',
@@ -275,14 +289,16 @@ function createPayments({connection,env=process.env,fetchImpl,now}) {
   });
   router.use(express.json({limit:'16kb'}),express.urlencoded({extended:false,limit:'64kb',parameterLimit:150}));
   const wrap=fn=>(req,res,next)=>Promise.resolve().then(()=>fn(req,res)).catch(next);
-  const owner=async req=>{const id=await service.authenticate(req.headers.authorization);limit('account:'+id,90);return id;};
-  router.get('/payments/health',(_req,res)=>res.json({ok:true,provider:'payu',testMode:config.mode==='test',paymentsEnabled:config.enabled}));
+  const identity=async req=>{if(!authenticateGoogle) fail(401,'google_login_required','Sign in with Google to purchase.');return authenticateGoogle(req.headers['x-game-session']);};
+  const owner=async req=>{const user=await identity(req);const id=await service.authenticate(req.headers.authorization);await service.authorizeAccount(id,user.sub);limit('account:'+id,90);return id;};
+  router.get('/payments/health',(_req,res)=>res.json({ok:true,provider:'payu',requiresGoogleLogin:true,testMode:config.mode==='test',paymentsEnabled:config.enabled}));
   router.get('/api/catalog',(_req,res)=>res.json(service.catalog()));
   router.post('/api/accounts',wrap(async(req,res)=>{
-    service.requireEnabled();limit('register:'+req.ip,10);
+    const user=await identity(req);service.requireEnabled();limit('register:'+req.ip,10);
     if (!object(req.body)||Object.keys(req.body).length) fail(400,'invalid_account','Send an empty JSON object.');
-    res.status(201).json(await service.createAccount());
+    res.status(201).json(await service.createAccount(user.sub));
   }));
+  router.post('/api/accounts/link',wrap(async(req,res)=>{const user=await identity(req);const id=await service.authenticate(req.headers.authorization);res.json(await service.linkAccount(id,user.sub));}));
   router.get('/api/wallet',wrap(async(req,res)=>res.json(await service.wallet(await owner(req)))));
   router.post('/api/orders',wrap(async(req,res)=>{
     const id=await owner(req);limit('orders:'+id,10);res.json(await service.createOrder(id,req.body));

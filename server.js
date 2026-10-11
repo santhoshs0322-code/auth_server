@@ -6,7 +6,8 @@ const jwt = require("jsonwebtoken");
 const mongoose = require("mongoose");
 const { OAuth2Client } = require("google-auth-library");
 const apps = require("./apps");
-const { createPayments } = require("./payu");
+const { createPayments, PaymentError } = require("./payu");
+const { createMonsterAuth } = require("./monster-auth");
 
 const required = ["MONGODB_URI", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "JWT_SECRET", "PUBLIC_URL"];
 for (const key of required) {
@@ -17,7 +18,7 @@ if (process.env.JWT_SECRET.length < 32) throw new Error("JWT_SECRET must contain
 const app = express();
 app.set("trust proxy", 1);
 app.disable("x-powered-by");
-const payments = createPayments({ connection: mongoose.connection });
+const payments = createPayments({ connection: mongoose.connection, authenticateGoogle: verifyMonsterSession });
 app.use(payments.router);
 app.use(cors({ origin: process.env.ALLOWED_ORIGIN || "*" }));
 app.use(express.json({ limit: "16kb" }));
@@ -69,6 +70,23 @@ function issueToken(user, appId) {
   });
 }
 
+async function verifyMonsterSession(token) {
+  try {
+    if (typeof token !== "string" || token.length > 4096) throw new Error("Invalid session");
+    const identity = jwt.verify(token, process.env.JWT_SECRET, {
+      issuer: "central-game-auth", audience: "monstermerge", algorithms: ["HS256"]
+    });
+    if (identity.appId !== "monstermerge" || typeof identity.sub !== "string" || !/^[a-f0-9]{24}$/.test(identity.sub)
+        || !identity.jti || await RevokedToken.exists({ jti: identity.jti })
+        || !await usersFor("monstermerge").exists({ _id: identity.sub })) throw new Error("Invalid session");
+    return identity;
+  } catch (_) { throw new PaymentError(401, "google_login_required", "Sign in with Google to purchase."); }
+}
+const monsterAuth = createMonsterAuth({ connection: mongoose.connection, google,
+  clientId: process.env.GOOGLE_CLIENT_ID, users: () => usersFor("monstermerge"), issueToken,
+  verifySession: verifyMonsterSession });
+app.use("/auth/monster", monsterAuth.router);
+
 async function requireAuth(req, res, next) {
   try {
     const token = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
@@ -89,6 +107,7 @@ app.get("/auth/google", async (req, res, next) => {
   try {
     const appId = String(req.query.app || "").toLowerCase();
     if (!apps[appId]) return res.status(400).json({ ok: false, message: "Unknown app" });
+    if (appId === "monstermerge") return res.status(400).json({ ok: false, message: "Start sign-in from Monster Merge." });
     const state = crypto.randomBytes(32).toString("hex");
     await OAuthState.create({ value: state, appId, expiresAt: new Date(Date.now() + 10 * 60 * 1000) });
     res.redirect(google.generateAuthUrl({
@@ -98,6 +117,10 @@ app.get("/auth/google", async (req, res, next) => {
 });
 
 app.get("/auth/google/callback", async (req, res) => {
+  if (typeof req.query.state === "string" && req.query.state.startsWith("mm_")) {
+    try { return await monsterAuth.callback(req, res); }
+    catch (_) { return res.status(500).send("Sign-in unavailable. Return to the game and try again."); }
+  }
   let stateRecord;
   try {
     stateRecord = await OAuthState.findOneAndDelete({ value: req.query.state, expiresAt: { $gt: new Date() } });
@@ -182,6 +205,7 @@ mongoose.connect(process.env.MONGODB_URI)
   .then(async () => {
     await Promise.all(Object.keys(apps).map(appId => usersFor(appId).init()));
     await payments.initialize();
+    await monsterAuth.initialize();
     app.listen(port, "0.0.0.0", () => console.log(`Central auth server listening on ${port}`));
   })
   .catch(error => { console.error("MongoDB connection failed", error); process.exit(1); });
