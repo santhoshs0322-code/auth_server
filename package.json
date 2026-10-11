@@ -2,8 +2,14 @@
   "name": "multi-app-google-auth-server",
   "version": "1.0.0",
   "private": true,
-  "engines": { "node": ">=22" },
-  "scripts": { "start": "node server.js", "check": "node --check server.js" },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js && node --check payu.js",
+    "test:payments": "node --test payu.test.js"
+  },
   "dependencies": {
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",

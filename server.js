@@ -6,6 +6,7 @@ const jwt = require("jsonwebtoken");
 const mongoose = require("mongoose");
 const { OAuth2Client } = require("google-auth-library");
 const apps = require("./apps");
+const { createPayments } = require("./payu");
 
 const required = ["MONGODB_URI", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "JWT_SECRET", "PUBLIC_URL"];
 for (const key of required) {
@@ -16,6 +17,8 @@ if (process.env.JWT_SECRET.length < 32) throw new Error("JWT_SECRET must contain
 const app = express();
 app.set("trust proxy", 1);
 app.disable("x-powered-by");
+const payments = createPayments({ connection: mongoose.connection });
+app.use(payments.router);
 app.use(cors({ origin: process.env.ALLOWED_ORIGIN || "*" }));
 app.use(express.json({ limit: "16kb" }));
 
@@ -178,6 +181,7 @@ const port = process.env.PORT || 3000;
 mongoose.connect(process.env.MONGODB_URI)
   .then(async () => {
     await Promise.all(Object.keys(apps).map(appId => usersFor(appId).init()));
+    await payments.initialize();
     app.listen(port, "0.0.0.0", () => console.log(`Central auth server listening on ${port}`));
   })
   .catch(error => { console.error("MongoDB connection failed", error); process.exit(1); });

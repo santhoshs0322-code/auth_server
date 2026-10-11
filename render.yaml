@@ -18,3 +18,13 @@ services:
         sync: false
       - key: ALLOWED_ORIGIN
         value: "*"
+      - key: PAYMENTS_ENABLED
+        value: "false"
+      - key: PAYMENT_MODE
+        value: "test"
+      - key: ALLOW_LIVE_PAYMENTS
+        value: "false"
+      - key: PAYU_KEY
+        sync: false
+      - key: PAYU_SALT
+        sync: false
