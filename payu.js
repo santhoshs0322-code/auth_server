@@ -53,8 +53,8 @@ function configuration(env) {
 }
 function page(title,body) {
   return `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>Monster Merge - PayU</title>
-  <style>body{background:#081c29;color:#effbff;font:16px system-ui;margin:0;padding:24px}main{max-width:430px;margin:5vh auto;padding:28px;background:#102d3b;border:1px solid #31606a;border-radius:24px}h1,h2{color:#ffd16a}label{display:block;margin:16px 0}input,button{box-sizing:border-box;width:100%;padding:14px;border-radius:10px;border:0;margin-top:6px}button{background:#76e1d0;color:#082a30;font-weight:bold;font-size:17px;cursor:pointer}p{line-height:1.6;color:#bed6df}</style>
-  <main><small>MONSTER MERGE</small><h1>${escape(title)}</h1>${body}</main></html>`;
+  <style>*{box-sizing:border-box}body{background:#f0f3f7;color:#172635;font:15px system-ui;margin:0;padding:20px}main{max-width:470px;margin:3vh auto;padding:28px;background:white;border:1px solid #dde4eb;border-radius:20px;box-shadow:0 16px 50px #1726350d}header{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #e6ebf0;padding-bottom:20px}small{font-weight:750;letter-spacing:1px}header span{color:#47716a;font-size:12px}h1{font-size:27px;letter-spacing:-.7px;margin:24px 0 10px}h2{font-size:28px;margin:6px 0}label{display:block;margin:18px 0;font-weight:600;font-size:13px}input,button{width:100%;padding:14px;border-radius:9px;border:1px solid #cbd5df;margin-top:7px;font:16px system-ui}input:focus{outline:2px solid #198772;outline-offset:2px}button{background:#146f5c;color:white;border:0;font-weight:700;cursor:pointer;min-height:52px}button:hover{background:#105a4b}p{line-height:1.6;color:#617081;font-size:13px}.summary{background:#f6f8fb;border:1px solid #e2e8ef;padding:18px;border-radius:12px;margin:18px 0}.line{display:flex;justify-content:space-between;gap:12px;margin:9px 0}.total{border-top:1px solid #dae1e9;padding-top:13px;font-size:20px;font-weight:750}.mode{padding:10px 12px;background:#fff4d5;color:#755509;border:1px solid #efda9d;border-radius:8px;font-size:12px;font-weight:700}.steps{color:#678075;font-size:12px;margin:20px 0}.reference{overflow-wrap:anywhere;font-size:11px;color:#788695}footer{border-top:1px solid #e6ebf0;margin-top:22px;padding-top:14px;font-size:11px;line-height:1.7;color:#788695}@media(max-width:400px){body{padding:10px}main{padding:20px;margin:1vh auto}}</style>
+  <main><header><small>MONSTER MERGE</small><span>Coin purchase</span></header><h1>${escape(title)}</h1>${body}<footer>Payment details are entered on PayU's hosted checkout. Coins are added only after the game server verifies the payment.</footer></main></html>`;
 }
 
 function modelsFor(connection,mode) {
@@ -160,13 +160,16 @@ class PayUService {
     const row=await this.checkoutOrder(token);
     if (row.status==='paid') return page('Payment confirmed','<p>Return to the game and refresh your balance.</p>');
     return page(`${row.coins.toLocaleString('en-IN')} game coins`,
-      `<p>${this.config.mode==='test'?'TEST MODE - no real money':'Secure PayU checkout'}</p><h2>INR ${money(row.amountPaise)}</h2>
+      `${this.config.mode==='test'?'<div class="mode">TEST MODE - no real money is charged</div>':'<p>One-time purchase through PayU</p>'}
+      <div class="steps">1. Contact details &nbsp; / &nbsp; 2. PayU payment &nbsp; / &nbsp; 3. Coins delivered</div>
+      <section class="summary"><div class="line"><span>Game coins</span><strong>${row.coins.toLocaleString('en-IN')}</strong></div><div class="line"><span>Purchase type</span><span>One-time coin pack</span></div><div class="line total"><span>Total</span><span>INR ${money(row.amountPaise)}</span></div></section>
+      <p class="reference">Order reference: ${escape(row._id)}</p>
       <form method="post" action="/checkout/${escape(token)}/pay">
       <label>First name<input name="firstname" autocomplete="given-name" maxlength="60" required></label>
       <label>Email<input name="email" type="email" autocomplete="email" maxlength="120" required></label>
       <label>Phone<input name="phone" type="tel" autocomplete="tel" pattern="[+]?[0-9]{10,15}" required></label>
       <button>Continue to PayU</button></form><p>PayU needs your contact details for this purchase. Enter card or UPI details on PayU only.</p>
-      <p>Return to the game after payment. Purchases belong to this installation.</p>`);
+      <p>After payment, return to the game and refresh your balance. This purchase is linked to your signed-in account on this installation.</p>`);
   }
   async startCheckout(token,body) {
     let row=await this.checkoutOrder(token);
@@ -188,7 +191,7 @@ class PayUService {
       surl:this.config.publicUrl+'/api/payu/return',furl:this.config.publicUrl+'/api/payu/return'};
     fields.hash=paymentHash(fields,this.config.salt);
     const inputs=Object.entries(fields).map(([k,v])=>`<input type="hidden" name="${k}" value="${escape(v)}">`).join('');
-    return page('Continue securely',`<form method="post" action="${this.config.checkoutUrl}">${inputs}<button>Pay INR ${money(row.amountPaise)} with PayU</button></form><p>Return to the game after payment.</p>`);
+    return page('Ready for PayU',`${this.config.mode==='test'?'<div class="mode">TEST MODE - no real money is charged</div>':''}<section class="summary"><div class="line"><span>${row.coins.toLocaleString('en-IN')} coins</span><strong>INR ${money(row.amountPaise)}</strong></div><p>Next, choose your payment method on PayU.</p></section><form method="post" action="${this.config.checkoutUrl}">${inputs}<button>Pay INR ${money(row.amountPaise)} with PayU</button></form><p>Return to the game after payment. A pending payment is not a completed purchase.</p>`);
   }
   async verifyPayment(id) {
     const fields={key:this.config.key,command:'verify_payment',var1:id,
