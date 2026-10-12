@@ -7,7 +7,7 @@
   },
   "scripts": {
     "start": "node server.js",
-    "check": "node --check server.js && node --check payu.js && node --check monster-auth.js",
+    "check": "node --check server.js && node --check payu.js && node --check monster-auth.js && node --check monster-profile.js",
     "test:payments": "node --test payu.test.js"
   },
   "dependencies": {

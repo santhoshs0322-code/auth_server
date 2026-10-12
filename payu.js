@@ -75,17 +75,28 @@ function modelsFor(connection,mode) {
 }
 
 class PayUService {
-  constructor({connection,config,fetchImpl=globalThis.fetch,now=Date.now}) {
+  constructor({connection,config,fetchImpl=globalThis.fetch,now=Date.now,profiles}) {
     this.connection=connection;this.config=config;this.fetch=fetchImpl;this.now=now;
     Object.assign(this,modelsFor(connection,config.mode));
+    this.profiles=profiles;
+  }
+  async syncProfile(googleUserId,session) {
+    if(!this.profiles||!/^[a-f0-9]{24}$/.test(googleUserId||''))return;
+    const accounts=await this.Account.find({googleUserId}).session(session||null).lean();
+    const ids=accounts.map(a=>a._id),total=accounts.reduce((sum,a)=>sum+a.creditedCoinsTotal,0);
+    const orders=await this.Order.find({accountId:{$in:ids}}).session(session||null).select('_id packId coins amountPaise currency status paymentId created').lean();
+    await this.profiles().updateOne({_id:googleUserId},{$set:{['payments.'+this.config.mode]:{accounts:ids,creditedCoinsTotal:total},['purchases.'+this.config.mode]:orders}},{session:session||null});
   }
   async initialize() { await Promise.all([this.Account.init(),this.Order.init(),this.Credit.init()]); }
   requireEnabled() { if (!this.config.enabled) fail(503,'payments_unavailable','Coin payments are not available yet.'); }
   catalog() { return {provider:'payu',requiresGoogleLogin:true,packs:PACKS,testMode:this.config.mode==='test',enabled:this.config.enabled}; }
-  async createAccount(googleUserId) {
+  async createAccount(googleUserId,preferredAccount) {
     if (!googleUserId) fail(401,'google_login_required','Sign in with Google to purchase.');
-    const accountId='acct_'+crypto.randomBytes(16).toString('hex'),token=crypto.randomBytes(48).toString('base64url');
-    await this.Account.create({_id:accountId,tokenHash:digest(token),googleUserId,created:this.now()});
+    const existing=await this.Account.findOne({googleUserId,...(preferredAccount?{_id:preferredAccount}:{})}).sort({created:1}).lean();
+    if(preferredAccount&&!existing)fail(403,'account_mismatch','Payment account belongs to a different Google user.');
+    const accountId=existing?existing._id:'acct_'+digest(googleUserId).slice(0,32),token=crypto.randomBytes(48).toString('base64url');
+    await this.Account.updateOne({_id:accountId},{$set:{tokenHash:digest(token)},$setOnInsert:{googleUserId,created:this.now(),creditedCoinsTotal:0}},{upsert:true});
+    await this.syncProfile(googleUserId);
     return {accountId,token};
   }
   async authenticate(header) {
@@ -94,10 +105,16 @@ class PayUService {
     if (!account) fail(401,'unauthorized','Invalid payment account.');
     return account._id;
   }
+  async creditedTotal(account) {
+    if(!account.googleUserId)return account.creditedCoinsTotal;
+    const accounts=await this.Account.find({googleUserId:account.googleUserId}).lean();
+    return accounts.reduce((total,item)=>total+item.creditedCoinsTotal,0);
+  }
   async linkAccount(accountId,googleUserId) {
     const linked=await this.Account.findOneAndUpdate({_id:accountId,$or:[{googleUserId:{$exists:false}},{googleUserId}]},
       {$set:{googleUserId}},{new:true}).lean();
     if(!linked) fail(403,'account_mismatch','This payment account belongs to another Google account.');
+    await this.syncProfile(googleUserId);
     return {accountId:linked._id};
   }
   async authorizeAccount(accountId,googleUserId) {
@@ -114,9 +131,10 @@ class PayUService {
   async response(row) {
     const account=await this.Account.findById(row.accountId).lean();
     if (!account) fail(401,'unauthorized','Account not found.');
+    await this.syncProfile(account.googleUserId);
     const status=row.status==='pending'&&this.now()>=row.expires?'expired':row.status;
     return {orderId:row._id,status,coins:row.coins,amountPaise:row.amountPaise,currency:row.currency,
-      creditedCoinsTotal:account.creditedCoinsTotal,
+        creditedCoinsTotal:await this.creditedTotal(account),
       checkoutUrl:status==='pending'?this.config.publicUrl+'/checkout/'+row.checkoutToken:''};
   }
   async createOrder(accountId,body) {
@@ -233,6 +251,8 @@ class PayUService {
           {$inc:{creditedCoinsTotal:row.coins}},{session});
         if (updated.modifiedCount!==1) fail(409,'wallet_unavailable','Wallet could not be updated.');
         await this.Order.updateOne({_id:row._id},{$set:{status:'paid',paymentId}},{session});
+        const account=await this.Account.findById(row.accountId).session(session).lean();
+        await this.syncProfile(account?.googleUserId,session);
       });
     } catch(error) {
       if (error.code!==11000) throw error;
@@ -257,7 +277,7 @@ class PayUService {
     }
     const account=await this.Account.findById(owner).lean();
     if (!account) fail(401,'unauthorized','Account not found.');
-    return {accountId:owner,creditedCoinsTotal:account.creditedCoinsTotal};
+    return {accountId:owner,creditedCoinsTotal:await this.creditedTotal(account)};
   }
   async callback(fields) {
     this.requireEnabled();
@@ -273,8 +293,8 @@ class PayUService {
   }
 }
 
-function createPayments({connection,env=process.env,fetchImpl,now,authenticateGoogle}) {
-  const config=configuration(env), service=new PayUService({connection,config,fetchImpl,now});
+function createPayments({connection,env=process.env,fetchImpl,now,authenticateGoogle,profiles}) {
+  const config=configuration(env), service=new PayUService({connection,config,fetchImpl,now,profiles});
   const router=express.Router(), buckets=new Map();
   const limit=(key,max)=>{
     const time=Date.now(),old=buckets.get(key);
@@ -297,9 +317,10 @@ function createPayments({connection,env=process.env,fetchImpl,now,authenticateGo
   router.get('/payments/health',(_req,res)=>res.json({ok:true,provider:'payu',requiresGoogleLogin:true,testMode:config.mode==='test',paymentsEnabled:config.enabled}));
   router.get('/api/catalog',(_req,res)=>res.json(service.catalog()));
   router.post('/api/accounts',wrap(async(req,res)=>{
-    const user=await identity(req);service.requireEnabled();limit('register:'+req.ip,10);
-    if (!object(req.body)||Object.keys(req.body).length) fail(400,'invalid_account','Send an empty JSON object.');
-    res.status(201).json(await service.createAccount(user.sub));
+    const user=await identity(req);limit('register:'+req.ip,10);
+    if (!object(req.body)||Object.keys(req.body).some(key=>key!=='accountId')) fail(400,'invalid_account','Invalid payment account request.');
+    if(req.body.accountId!==undefined&&(typeof req.body.accountId!=='string'||req.body.accountId.length>100))fail(400,'invalid_account','Invalid payment account.');
+    res.status(201).json(await service.createAccount(user.sub,req.body.accountId));
   }));
   router.post('/api/accounts/link',wrap(async(req,res)=>{const user=await identity(req);const id=await service.authenticate(req.headers.authorization);res.json(await service.linkAccount(id,user.sub));}));
   router.get('/api/wallet',wrap(async(req,res)=>res.json(await service.wallet(await owner(req)))));

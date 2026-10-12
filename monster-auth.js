@@ -65,7 +65,8 @@ function createMonsterAuth({connection,google,clientId,users,issueToken,verifySe
       const profile=ticket.getPayload();
       if(!profile||!profile.sub||profile.email_verified!==true||profile.nonce!==attempt.nonce)throw new Error('Invalid identity');
       const user=await users().findOneAndUpdate({googleSub:profile.sub},{$set:{email:profile.email,
-        name:profile.name||profile.email,picture:profile.picture||'',lastLoginAt:new Date(now())}},
+        playerId:profile.sub,displayName:profile.name||profile.email,provider:'google',
+        name:profile.name||profile.email,picture:profile.picture||'',lastLoginAt:new Date(now())},$inc:{loginCount:1}},
         {new:true,upsert:true,setDefaultsOnInsert:true});
       const completed=await Login.updateOne({_id:state,status:'processing',expiresAt:{$gt:new Date(now())}},{$set:{status:'ready',userId:user.id}});
       if(completed.modifiedCount!==1)throw new Error('Sign-in expired');

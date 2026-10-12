@@ -104,7 +104,7 @@ test('bearer tokens are hashed and another account cannot query an order',async(
   assert.notEqual(stored.tokenHash,account.token);assert.equal(stored.token,undefined);
   assert.equal(await service.authenticate('Bearer '+account.token),account.accountId);
   await rejects(()=>service.authenticate('Bearer bad'),'unauthorized');
-  const other=await service.createAccount('google-fixture');
+  const other=await service.createAccount('other-google-fixture');
   await rejects(()=>service.getOrder(other.accountId,order.orderId),'order_not_found');
 });
 test('contact validation, HTML escaping and no salt or bearer in checkout',async()=>{
@@ -205,13 +205,13 @@ test('HTTP app contract, form callbacks, webhook replay and unrelated routes',as
 });
 test('actual auth server boots with payments disabled and preserves Google routes',async()=>{
   const port=await freePort();
-  const child=spawn(process.execPath,[path.join(__dirname,'server.js')],{cwd:__dirname,windowsHide:true,stdio:'ignore',
+  const child=spawn(process.execPath,[path.join(__dirname,'server.js')],{cwd:__dirname,windowsHide:true,stdio:['ignore','ignore','pipe'],
     env:{...process.env,MONGODB_URI:uri,PORT:String(port),PUBLIC_URL:'https://payments.example',
       GOOGLE_CLIENT_ID:'fixture.apps.googleusercontent.com',GOOGLE_CLIENT_SECRET:'fixture-google-secret',
-      JWT_SECRET:'test-fixture-jwt-secret-longer-than-32-characters',PAYMENTS_ENABLED:'false',PAYMENT_MODE:'test',PAYU_KEY:'',PAYU_SALT:''}});
+      MONSTER_MONGODB_DATABASE:'monster_disabled_fixture',JWT_SECRET:'test-fixture-jwt-secret-longer-than-32-characters',PAYMENTS_ENABLED:'false',PAYMENT_MODE:'test',PAYU_KEY:'',PAYU_SALT:''}});
   try{
     let healthy=false;
-    for(let i=0;i<80;i++){
+    for(let i=0;i<200;i++){
       if(child.exitCode!==null)throw new Error('Auth server exited before readiness');
       try{const r=await fetch(`http://127.0.0.1:${port}/health`);if(r.ok){healthy=true;break;}}catch(_){}
       await pause(100);
@@ -282,18 +282,19 @@ test('deployed-style server enforces real signed Monster Merge JWT for purchases
   const userId=new mongoose.Types.ObjectId();
   await connection.db.collection('monstermerge_users').insertOne({_id:userId,googleSub:'google-auth-integration-fixture',
     email:'fixture@example.com',name:'Test User',createdAt:new Date(),lastLoginAt:new Date()});
-  const child=spawn(process.execPath,[path.join(__dirname,'server.js')],{cwd:__dirname,windowsHide:true,stdio:'ignore',
+  const child=spawn(process.execPath,[path.join(__dirname,'server.js')],{cwd:__dirname,windowsHide:true,stdio:['ignore','ignore','pipe'],
     env:{...process.env,MONGODB_URI:uri,PORT:String(port),PUBLIC_URL:'https://payments.example',PAYU_PUBLIC_URL:'https://payments.example',
       GOOGLE_CLIENT_ID:'fixture.apps.googleusercontent.com',GOOGLE_CLIENT_SECRET:'fixture-google-secret',JWT_SECRET:secret,
       PAYMENTS_ENABLED:'true',PAYMENT_MODE:'test',PAYU_KEY:'fixture-key',PAYU_SALT:'fixture-salt'}});
+  let diagnostics='';child.stderr.on('data',chunk=>diagnostics+=chunk.toString());
   const base=`http://127.0.0.1:${port}`;
   const token=(app='monstermerge',options={})=>jwt.sign({sub:String(userId),appId:app},secret,{issuer:'central-game-auth',audience:app,jwtid:crypto.randomUUID(),expiresIn:'1h',...options});
   const request=(path,session,body={},bearer='')=>fetch(base+path,{method:'POST',headers:{'Content-Type':'application/json',
     ...(session?{'X-Game-Session':session}:{}),...(bearer?{Authorization:'Bearer '+bearer}:{})},body:JSON.stringify(body)});
   try {
     let ready=false;
-    for(let i=0;i<80;i++){try{if((await fetch(base+'/health')).ok){ready=true;break;}}catch(_){}await pause(100);}
-    assert.equal(ready,true);
+    for(let i=0;i<200;i++){try{if((await fetch(base+'/health')).ok){ready=true;break;}}catch(_){}await pause(100);}
+    assert.equal(ready,true,diagnostics||"no diagnostics");
     assert.equal((await (await fetch(base+'/api/catalog')).json()).requiresGoogleLogin,true);
     for(const invalid of ['',token('balloonpop'),token('monstermerge',{expiresIn:-1}),token()+'broken'])
       assert.equal((await request('/api/accounts',invalid)).status,401);
@@ -302,6 +303,22 @@ test('deployed-style server enforces real signed Monster Merge JWT for purchases
     response=await request('/api/orders','',{packId:'starter',requestId:'auth_order_1'},buyer.token);assert.equal(response.status,401);
     response=await request('/api/orders',signed,{packId:'starter',requestId:'auth_order_1'},buyer.token);assert.equal(response.status,200);
     const created=await response.json();assert.equal(created.amountPaise,4900);
+    const getProfile=()=>fetch(base+'/auth/monster/profile',{headers:{Authorization:'Bearer '+signed}});
+    let profile=await (await getProfile()).json();assert.equal(profile.success,true);assert.equal(profile.save,null);assert.equal(profile.revision,0);
+    const save={version:1,coins:125,level:2,unlocked:['dragon','shark'],selected:'shark',dragonMastery:[{id:'shark',stage:2}],goldSkin:false,music:1,sfx:1,lastDaily:'',paidCreditsApplied:0,paymentAccountId:buyer.accountId};
+    const upload=(revision,data)=>request('/auth/monster/profile','',{revision,save:data},signed);
+    response=await upload(0,save);assert.equal(response.status,200);assert.equal((await response.json()).revision,1);
+    assert.equal((await upload(0,save)).status,200,'identical retry is idempotent');
+    assert.equal((await upload(0,{...save,coins:999})).status,409,'stale device cannot overwrite');
+    assert.equal((await upload(1,{...save,paidCreditsApplied:500})).status,409,'client cannot forge paid credits');
+    assert.equal((await upload(1,{...save,paymentAccountId:'another-player'})).status,409);
+    profile=await (await getProfile()).json();assert.equal(profile.save.coins,125);assert.equal(profile.save.selected,'shark');assert.equal(profile.save.dragonMastery[0].stage,2);
+    const recovered=await (await request('/api/accounts',signed,{accountId:buyer.accountId})).json();assert.equal(recovered.accountId,buyer.accountId,'new device recovers same wallet');
+    assert.equal((await request('/api/accounts',signed,{accountId:'acct_wrong_owner'})).status,403);
+    const target=connection.useDb('monstermerge');
+    assert.equal(await target.db.collection('players').countDocuments({googleSub:'google-auth-integration-fixture'}),1);
+    assert.equal(await connection.db.collection('monstermerge_users').countDocuments({_id:userId}),1,'migration keeps old record');
+    const player=await target.db.collection('players').findOne({_id:userId});assert.equal(player.testProfile.save.coins,125);assert.equal(player.purchases.test.length,1);
     const revoked=jwt.decode(signed);await connection.db.collection('revoked_tokens').insertOne({jti:revoked.jti,expiresAt:new Date(revoked.exp*1000)});
     response=await request('/api/orders',signed,{packId:'starter',requestId:'auth_order_2'},buyer.token);assert.equal(response.status,401);
   }finally{if(child.exitCode===null){const done=once(child,'exit');child.kill();await done;}}

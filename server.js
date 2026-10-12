@@ -8,6 +8,7 @@ const { OAuth2Client } = require("google-auth-library");
 const apps = require("./apps");
 const { createPayments, PaymentError } = require("./payu");
 const { createMonsterAuth } = require("./monster-auth");
+const { createMonsterProfile, migrateMonsterDatabase } = require("./monster-profile");
 
 const required = ["MONGODB_URI", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "JWT_SECRET", "PUBLIC_URL"];
 for (const key of required) {
@@ -18,7 +19,10 @@ if (process.env.JWT_SECRET.length < 32) throw new Error("JWT_SECRET must contain
 const app = express();
 app.set("trust proxy", 1);
 app.disable("x-powered-by");
-const payments = createPayments({ connection: mongoose.connection, authenticateGoogle: verifyMonsterSession });
+const monsterDatabase=process.env.MONSTER_MONGODB_DATABASE||"monstermerge";
+if(!/^[A-Za-z0-9_-]{1,64}$/.test(monsterDatabase)||monsterDatabase==="candycraze")throw new Error("Monster Merge requires its own database name");
+const monsterConnection=mongoose.connection.useDb(monsterDatabase,{useCache:true});
+const payments = createPayments({ connection: monsterConnection, authenticateGoogle: verifyMonsterSession, profiles:()=>usersFor("monstermerge") });
 app.use(payments.router);
 app.use(cors({ origin: process.env.ALLOWED_ORIGIN || "*" }));
 app.use(express.json({ limit: "16kb" }));
@@ -28,6 +32,8 @@ const userSchema = new mongoose.Schema({
   email: { type: String, required: true, lowercase: true, trim: true },
   name: { type: String, required: true, trim: true },
   picture: { type: String, default: "" },
+  playerId:String,displayName:String,provider:String,loginCount:{type:Number,default:0},saveCount:{type:Number,default:0},
+  profile:mongoose.Schema.Types.Mixed,testProfile:mongoose.Schema.Types.Mixed,payments:mongoose.Schema.Types.Mixed,purchases:mongoose.Schema.Types.Mixed,
   lastLoginAt: { type: Date, default: Date.now }
 }, { timestamps: true, versionKey: false });
 
@@ -36,7 +42,7 @@ function usersFor(appId) {
   const config = apps[appId];
   if (!config) return null;
   if (!userModels.has(appId)) {
-    userModels.set(appId, mongoose.model(`User_${appId}`, userSchema, config.userCollection));
+    userModels.set(appId, appId==="monstermerge"?monsterConnection.model("MonsterPlayer",userSchema,"players"):mongoose.model(`User_${appId}`, userSchema, config.userCollection));
   }
   return userModels.get(appId);
 }
@@ -82,10 +88,11 @@ async function verifyMonsterSession(token) {
     return identity;
   } catch (_) { throw new PaymentError(401, "google_login_required", "Sign in with Google to purchase."); }
 }
-const monsterAuth = createMonsterAuth({ connection: mongoose.connection, google,
+const monsterAuth = createMonsterAuth({ connection: monsterConnection, google,
   clientId: process.env.GOOGLE_CLIENT_ID, users: () => usersFor("monstermerge"), issueToken,
   verifySession: verifyMonsterSession });
 app.use("/auth/monster", monsterAuth.router);
+app.use("/auth/monster/profile",createMonsterProfile({users:()=>usersFor("monstermerge"),verifySession:verifyMonsterSession,payments:payments.service,mode:payments.service.config.mode}));
 
 async function requireAuth(req, res, next) {
   try {
@@ -201,8 +208,10 @@ app.use((error, _req, res, _next) => {
 });
 
 const port = process.env.PORT || 3000;
+
 mongoose.connect(process.env.MONGODB_URI)
   .then(async () => {
+    await migrateMonsterDatabase(mongoose.connection,monsterConnection);
     await Promise.all(Object.keys(apps).map(appId => usersFor(appId).init()));
     await payments.initialize();
     await monsterAuth.initialize();
