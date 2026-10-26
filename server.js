@@ -6,7 +6,7 @@ const jwt = require("jsonwebtoken");
 const mongoose = require("mongoose");
 const { OAuth2Client } = require("google-auth-library");
 const apps = require("./apps");
-const { createPayments, PaymentError } = require("./payu");
+const { createPayments, PaymentError } = require("./games/monstermerge/play-billing");
 const { createMonsterAuth } = require("./monster-auth");
 const { createMonsterProfile, migrateMonsterDatabase } = require("./monster-profile");
 
