@@ -29,3 +29,5 @@ https://central-game-auth.onrender.com/auth/google/callback
 Apps begin login at `GET /auth/google?app=balloonpop` or `GET /auth/google?app=candycraze`. The issued session token is bound to that app and cannot read another app's collection.
 
 For local development, copy `.env.example` to `.env` and run `docker compose up --build` or `npm install && npm start`.
+
+MotionMagic AI has a separate native Google login module. See [MOTION_AI_SETUP.md](MOTION_AI_SETUP.md) for deployment, the `MOTION_AI_` environment variables and the `/auth/motion-ai` API contract.

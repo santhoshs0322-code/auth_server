@@ -7,7 +7,8 @@
   },
   "scripts": {
     "start": "node server.js",
-    "check": "node --check server.js && node --check payu.js && node --check monster-auth.js && node --check monster-profile.js",
+    "check": "node --check server.js && node --check payu.js && node --check monster-auth.js && node --check monster-profile.js && node --check motion-ai-auth.js",
+    "test:motion-ai": "node --test motion-ai-auth.test.js",
     "test:payments": "node --test payu.test.js"
   },
   "dependencies": {

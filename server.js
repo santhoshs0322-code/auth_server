@@ -6,6 +6,7 @@ const jwt = require("jsonwebtoken");
 const mongoose = require("mongoose");
 const { OAuth2Client } = require("google-auth-library");
 const apps = require("./apps");
+const { createMotionAiAuth } = require("./motion-ai-auth");
 const { createPayments, PaymentError } = require("./payu");
 const { createMonsterAuth } = require("./monster-auth");
 const { createMonsterProfile, migrateMonsterDatabase } = require("./monster-profile");
@@ -25,6 +26,8 @@ const monsterConnection=mongoose.connection.useDb(monsterDatabase,{useCache:true
 const payments = createPayments({ connection: monsterConnection, authenticateGoogle: verifyMonsterSession, profiles:()=>usersFor("monstermerge") });
 app.use(payments.router);
 app.use(cors({ origin: process.env.ALLOWED_ORIGIN || "*" }));
+const motionAiAuth = createMotionAiAuth({ connection: mongoose.connection });
+app.use("/auth/motion-ai", motionAiAuth.router);
 app.use(express.json({ limit: "16kb" }));
 
 const userSchema = new mongoose.Schema({
@@ -215,6 +218,7 @@ mongoose.connect(process.env.MONGODB_URI)
     await Promise.all(Object.keys(apps).map(appId => usersFor(appId).init()));
     await payments.initialize();
     await monsterAuth.initialize();
+    await motionAiAuth.initialize();
     app.listen(port, "0.0.0.0", () => console.log(`Central auth server listening on ${port}`));
   })
   .catch(error => { console.error("MongoDB connection failed", error); process.exit(1); });

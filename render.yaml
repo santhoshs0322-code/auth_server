@@ -28,3 +28,11 @@ services:
         sync: false
       - key: PAYU_SALT
         sync: false
+      - key: MOTION_AI_AUTH_ENABLED
+        value: "false"
+      - key: MOTION_AI_GOOGLE_CLIENT_ID
+        sync: false
+      - key: MOTION_AI_JWT_SECRET
+        generateValue: true
+      - key: MOTION_AI_MONGODB_DATABASE
+        value: "motionmagic"
